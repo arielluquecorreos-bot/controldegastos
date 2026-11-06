@@ -594,91 +594,92 @@ function setSyncStatus(estado, label) {
   lbl.textContent = label;
 }
 
-async function sincronizarSheets() {
-  if (!navigator.onLine) { toast('⚠️ Sin internet. Los datos están guardados localmente.'); return; }
-  setSyncStatus('syncing', 'Sincronizando...');
-  toast('☁️ Sincronizando con Google Sheets...');
-  try {
-    const resp = await fetch(SHEETS_URL, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'sync', movimientos: movs })
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      const ahora = new Date().toLocaleString('es-AR');
-      localStorage.setItem('ultima_sync', ahora);
-      setSyncStatus('ok', 'Sincronizado');
-      actualizarLabelSync();
-      toast('✅ '+data.total+' registros sincronizados con Google Sheets');
-      actualizarEstadoNube(true);
-    } else {
-      throw new Error('Error en sheets');
-    }
-  } catch(e) {
-    setSyncStatus('error', 'Error sync');
-    toast('❌ No se pudo sincronizar. Revisá la conexión.');
-    actualizarEstadoNube(false);
+// ===== SINCRONIZACIÓN SEGURA (une, nunca pisa) =====
+function getBorrados() {
+  try { return JSON.parse(localStorage.getItem('gastos_borrados') || '[]'); } catch(e) { return []; }
+}
+function addBorrado(id) {
+  const b = getBorrados();
+  if (!b.includes(Number(id))) {
+    b.push(Number(id));
+    localStorage.setItem('gastos_borrados', JSON.stringify(b.slice(-3000)));
   }
 }
+function normalizar(m) {
+  const id = Number(m.id), monto = Number(m.monto);
+  const anio = Number(m.anio), mes = Number(m.mes), dia = Number(m.dia);
+  return { ...m, id, monto, anio, mes, dia, fecha: pad(dia)+'/'+pad(mes)+'/'+anio };
+}
 
-async function syncBackground() {
-  if (!navigator.onLine) return;
+let syncEnCurso = false;
+async function sincronizarSeguro(silencioso) {
+  if (!navigator.onLine) {
+    setSyncStatus('error', 'Sin internet');
+    if (!silencioso) toast('⚠️ Sin internet. Tus datos siguen guardados en el celu.');
+    return false;
+  }
+  if (syncEnCurso) return false;
+  syncEnCurso = true;
+  setSyncStatus('syncing', 'Sincronizando...');
   try {
-    await fetch(SHEETS_URL, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'sync', movimientos: movs })
+    // 1) Bajar lo que hay en la nube. Si esto falla, NO se sube nada.
+    const r1 = await fetch(SHEETS_URL, { method:'POST', body: JSON.stringify({ action:'get' }) });
+    const d1 = await r1.json();
+    if (!d1.ok || !Array.isArray(d1.movimientos)) throw new Error('No se pudo leer la nube');
+
+    // 2) Unir: lo del celu + lo que falte de la nube (por id), sin los borrados a propósito
+    const borrados = new Set(getBorrados());
+    const nube = d1.movimientos.map(normalizar)
+      .filter(m => m.id && m.anio && m.mes && m.dia && !isNaN(m.monto));
+    const mapa = new Map();
+    movs.forEach(m => { if (!borrados.has(Number(m.id))) mapa.set(Number(m.id), m); });
+    let agregados = 0;
+    nube.forEach(m => {
+      if (!borrados.has(m.id) && !mapa.has(m.id)) { mapa.set(m.id, m); agregados++; }
     });
-    const ahora = new Date().toLocaleString('es-AR');
-    localStorage.setItem('ultima_sync', ahora);
+    const unidos = [...mapa.values()].sort((a,b) => b.id - a.id);
+
+    if (unidos.length === 0) { setSyncStatus('ok', 'Conectado'); return true; }
+
+    // copia de seguridad local antes de cambiar nada
+    if (movs.length > 0) localStorage.setItem('gastos_snap', JSON.stringify(movs));
+    movs = unidos; save();
+
+    // 3) Subir la unión completa
+    const r2 = await fetch(SHEETS_URL, { method:'POST', body: JSON.stringify({ action:'sync', movimientos: movs }) });
+    const d2 = await r2.json();
+    if (!d2.ok) throw new Error('No se pudo escribir en la nube');
+
+    localStorage.setItem('ultima_sync', new Date().toLocaleString('es-AR'));
     setSyncStatus('ok', 'Sincronizado');
     actualizarLabelSync();
+    actualizarEstadoNube(true);
+    if (!silencioso) toast(agregados > 0
+      ? '✅ Se unieron '+agregados+' registros de la nube. Total: '+movs.length
+      : '✅ Todo al día. Total: '+movs.length);
+    else if (agregados > 0) toast('✅ Se recuperaron '+agregados+' registros de la nube');
+    return true;
   } catch(e) {
-    setSyncStatus('error', 'Sin sync');
+    setSyncStatus('error', 'Error sync');
+    actualizarEstadoNube(false);
+    if (!silencioso) toast('❌ No se pudo sincronizar. Tus datos siguen en el celu.');
+    return false;
+  } finally {
+    syncEnCurso = false;
+    actualizarResumen(); actualizarConsulta();
   }
 }
 
-async function recuperarSheets() {
-  if (!navigator.onLine) { toast('⚠️ Sin internet para recuperar datos.'); return; }
-  if (!confirm('¿Recuperar datos desde Google Sheets? Esto reemplaza los datos locales actuales.')) return;
-  setSyncStatus('syncing', 'Recuperando...');
-  toast('🔄 Recuperando datos desde la nube...');
-  try {
-    const resp = await fetch(SHEETS_URL, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'get' })
-    });
-    const data = await resp.json();
-    if (data.ok && data.movimientos) {
-      const nuevos = data.movimientos.map(m => {
-        const id = Number(m.id);
-        const monto = Number(m.monto);
-        const anio = Number(m.anio);
-        const mes  = Number(m.mes);
-        const dia  = Number(m.dia);
-        // Reconstruir fecha siempre desde dia/mes/anio para evitar formato ISO
-        const fecha = pad(dia) + '/' + pad(mes) + '/' + anio;
-        return { ...m, id, monto, anio, mes, dia, fecha };
-      });
-      // Eliminar duplicados por id, quedarse con el más reciente
-      const sinDuplicados = [];
-      const vistos = new Set();
-      for (const m of nuevos) {
-        if (!vistos.has(m.id)) { vistos.add(m.id); sinDuplicados.push(m); }
-      }
-      if (sinDuplicados.length === 0) { toast('⚠️ No hay datos en Google Sheets todavía'); return; }
-      movs = sinDuplicados;
-      save();
-      actualizarResumen(); actualizarConsulta();
-      setSyncStatus('ok', 'Sincronizado');
-      toast('✅ '+sinDuplicados.length+' registros recuperados correctamente');
-      actualizarEstadoNube(true);
-    } else {
-      throw new Error('Sin datos');
-    }
-  } catch(e) {
-    setSyncStatus('error', 'Error');
-    toast('❌ No se pudo recuperar. Revisá la conexión.');
-  }
+function sincronizarSheets() { return sincronizarSeguro(false); }
+
+function syncBackground() {
+  clearTimeout(window._syncTimer);
+  window._syncTimer = setTimeout(() => sincronizarSeguro(true), 1500);
+}
+
+function recuperarSheets() {
+  if (!confirm('Esto UNE los datos de Google Sheets con los que tenés en el celu. No borra nada. ¿Seguimos?')) return;
+  return sincronizarSeguro(false);
 }
 
 function actualizarLabelSync() {
@@ -844,6 +845,7 @@ function movItem(m,botones,origen) {
 // ===== ELIMINAR =====
 function eliminar(id,origen) {
   if (!confirm('¿Eliminar este movimiento?')) return;
+  addBorrado(id);
   movs=movs.filter(m=>m.id!==id); save();
   if (origen==='resumen') actualizarResumen(); else actualizarConsulta();
   toast('🗑️ Eliminado');
@@ -987,16 +989,9 @@ function migrarFechas() {
 migrarFechas();
 actualizarResumen();
 actualizarLabelSync();
-// check conexion al arrancar
-if (navigator.onLine) {
-  setSyncStatus('syncing','Verificando...');
-  fetch(SHEETS_URL, { method:'POST', body:JSON.stringify({action:'get'}) })
-    .then(r=>r.json())
-    .then(d=>{ if(d.ok){ setSyncStatus('ok','Conectado'); } })
-    .catch(()=>setSyncStatus('error','Sin conexión'));
-} else {
-  setSyncStatus('error','Sin internet');
-}
+// al arrancar: traer lo que haya en la nube y unirlo con lo local
+if (navigator.onLine) { sincronizarSeguro(true); }
+else { setSyncStatus('error','Sin internet'); }
 </script>
 </body>
 </html>
